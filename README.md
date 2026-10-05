@@ -1,99 +1,146 @@
-# Security Under Diffusion Benchmark
+# Security Under Diffusion
 
-Security-focused diffusion deepfake benchmark for document, headshot, and scene verification. The repo evaluates two detectors under seen and unseen generator shifts, with both PNG and JPEG-90 variants.
+**A benchmark showing how diffusion-deepfake detectors hold up against image generators they were never trained on, measured at the false-positive rates that identity verification (KYC) and security operations (SOC) teams actually run at.**
 
-## Detectors
+Most deepfake detectors are evaluated on the same generator they were trained on, at whatever threshold makes the numbers look good. Real fraud pipelines don't work that way. Attackers use the newest model available, and a fraud team can only afford to flag a tiny fraction of real customers. This project measures the gap between those two worlds.
 
-- **DIRE**: pretrained diffusion reconstruction error, inference-only
-- **HFreq**: frequency-domain CNN trained per scenario
+📄 [Paper (PDF)](Security%20Under%20Diffusion_Paper.pdf) · ✍️ [Write-up on Medium](https://medium.com/@jeevanparajuli856/what-my-deepfake-security-benchmark-taught-me-3f60411a0cac)
 
-## Quick start
+---
 
-1) Install dependencies from [requirements.txt](requirements.txt).
+## Key findings
+
+| | |
+|---|---|
+| **Frequency beats reconstruction** | A small CNN on the Fourier spectrum (HFreq) reached AUROC 0.95–1.00 on the seen generator in every scenario. A pretrained DIRE checkpoint was near random on headshots (0.58) and inverted on scenes (0.08). |
+| **New generators break detectors** | On headshots, HFreq caught **49%** of Stable Diffusion fakes at a 1% false-positive rate, but only **4–8%** of Gemini fakes it had never seen. |
+| **Ranking ≠ deployability** | HFreq's ranking stayed strong on unseen generators (AUROC 0.79–1.00), but strong ranking didn't translate into catches at strict, pre-set thresholds. AUROC alone overstates how ready a detector is for production. |
+| **JPEG doesn't matter (at q=90)** | Re-encoding every image as JPEG-90 changed AUROC by less than 0.01 for both detectors. |
+
+### AUROC by scenario (PNG)
+
+| Detector | Scenario | Seen: SD v2 | Unseen: Gemini 2.5 Flash Image | Unseen: Gemini 3 Pro Image |
+|---|---|---|---|---|
+| HFreq | Document | 0.999 | 0.785 | 0.797 |
+| HFreq | Headshot | 0.946 | 0.896 | 0.899 |
+| HFreq | Scene | 1.000 | 1.000 | 1.000 |
+| DIRE | Document | 0.821 | 0.728 | 0.381 |
+| DIRE | Headshot | 0.581 | 0.446 | 0.491 |
+| DIRE | Scene | 0.078 | 0.290 | 0.163 |
+
+Full tables, including TPR at 1%, 0.5% and 0.1% FPR and the JPEG-90 results, are in the [paper](Security%20Under%20Diffusion_Paper.pdf).
+
+---
+
+## What's in the benchmark
+
+**Threat model.** An attacker submits an AI-generated ID photo, selfie, or scene image to an automated check. They have access to current commercial generators. The defender must keep false positives low, because every false alarm is a blocked real customer or a wasted analyst hour.
+
+**Dataset: 4,499 images, 128×128, three scenarios**
+
+| Source | Images | Used for |
+|---|---|---|
+| Real (bona fide) | 1,500 | train / val / seen test |
+| Stable Diffusion v2 | 1,500 | train / val / seen test |
+| Gemini 2.5 Flash Image ("Nano Banana") | 1,001 | unseen test only |
+| Gemini 3 Pro Image ("Nano Banana Pro") | 499 | unseen test only |
+
+- Scenarios: `doc` (privacy-masked ID documents), `headshot` (selfies), `scene` (natural scenes, no people)
+- Every image is stored as a lossless PNG master plus a JPEG-90 copy
+- Detectors are trained and calibrated **only** on real + SD v2. The Gemini images are held out completely.
+
+**Detectors**
+
+- **DIRE**: diffusion reconstruction error with the pretrained ImageNet-ADM checkpoint (ResNet-50), run zero-shot.
+- **HFreq**: a compact ResNet-style CNN on the Hamming-windowed log-magnitude FFT spectrum, trained per scenario (Adam, early stopping on validation AUROC; under 15 minutes per scenario on one RTX 4090).
+
+**Evaluation protocol**
+
+1. Calibrate a decision threshold per detector and scenario on the **validation** split, targeting fixed FPRs (1%, 0.1%).
+2. Freeze those thresholds and apply them to the seen and unseen test sets, the way a deployed system would.
+3. Report AUROC plus TPR at each FPR target, separately for each generator.
+
+---
+
+## Repository layout
 
 ```
-python -m venv venv
-venv/Scripts/python.exe -m pip install -r requirements.txt
+configs/         global.yaml (seed, FPR targets, device), dire.yaml, hfreq.yml
+detectors/       DIRE and HFreq model code + checkpoints
+preprocessing/   per-detector input pipelines (normalization, FFT)
+runners/         run_all.py orchestrates every detector × scenario × variant
+evaluation/      calibrate.py, scorer.py, metrics.py, plot_results.py
+utils/           logging
 ```
 
-2) Prepare data and manifests.
-
-- PNG masters: [data/images/](data/images/)
-- JPEG-90 mirrors: [data/images_jpeg/](data/images_jpeg/)
-- Master manifest: [data/manifests/master_manifest.csv](data/manifests/master_manifest.csv)
-
-3) Run the full benchmark.
-
-```
-python -m runners.run_all --dire_ckpt detectors/checkpoints/imagenet_adm.pth --plot
-```
-
-4) Run JPEG-only evaluation (uses existing models and calibration).
-
-```
-python -m runners.run_all --jpeg --dire_ckpt detectors/checkpoints/imagenet_adm.pth --plot --plot_variant jpeg
-```
-
-Outputs are written under [outputs/](outputs/) by default.
-
-## Data layout
-
-Expected structure (relative paths are stored in manifests):
-
-```
-data/
-	images/
-		doc/
-		headshot/
-		scene/
-	images_jpeg/
-		doc/
-		headshot/
-		scene/
-```
-
-## Manifest schema
-
-Manifests are CSVs with this header:
+Everything is driven by a CSV manifest, so new generators or scenarios can be added without code changes:
 
 ```
 image_id,path,label,scenario,source,generator_family,split
 ```
 
-Field meanings:
+- `label`: 0 = real, 1 = AI-generated
+- `scenario`: `doc` | `headshot` | `scene`
+- `generator_family`: `real` | `sd` | `nano25` | `nanopro`
+- `split`: `train` | `val` | `test_seen` | `test_unseen`
 
-- `label`: 0 = bona fide, 1 = AI-generated
-- `scenario`: `doc`, `headshot`, `scene`
-- `generator_family`: `real`, `sd`, `nano25`, `nanopro`
-- `split`: `train`, `val`, `test_seen`, `test_unseen`
+---
 
-## Dataset splits
+## Quick start
 
-- Seen: `real` and `sd`
-- Unseen: `nano25` and `nanopro`
-- Train and validation use only seen generators
+```bash
+python -m venv venv
+source venv/bin/activate            # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+```
 
-## Checkpoints
+Put the data here (relative paths are stored in the manifest):
 
-Available checkpoints live under [detectors/checkpoints/](detectors/checkpoints/).
-Use the one that matches your experiment goal.
+```
+data/
+  images/{doc,headshot,scene}/          # PNG masters
+  images_jpeg/{doc,headshot,scene}/     # JPEG-90 copies
+  manifests/master_manifest.csv
+```
 
-## Helper scripts (optional)
+Run the full benchmark (PNG):
 
-Local helper scripts may exist under [scripts/](scripts/) for manifest building, sanity checks, and JPEG conversion. These are optional utilities and may not be tracked in the repo.
+```bash
+python -m runners.run_all --dire_ckpt detectors/checkpoints/imagenet_adm.pth --plot
+```
 
-## Paper and citation
+Re-run on JPEG-90 using the trained models and the existing calibration:
 
-An EPUB version of the paper is included in this repository for citation. Add the EPUB file to the repo root or a dedicated paper folder and keep the filename stable for citation.
+```bash
+python -m runners.run_all --jpeg --dire_ckpt detectors/checkpoints/imagenet_adm.pth --plot --plot_variant jpeg
+```
 
-If you use this benchmark or the accompanying paper, please cite or contact:
+Results, metrics JSON, and figures are written to `outputs/`. Seeds are fixed in `configs/global.yaml`.
 
-Jeevan Parajuli  
-Department of Computer Science  
-University of Louisiana Monroe  
-Monroe, LA, USA  
-parajulij@warhawks.ulm.edu
+---
 
-## Recommended citation text
+## Limitations
 
-Jeevan Parajuli. Security Under Diffusion Benchmark. 2026. EPUB available in the project repository.
+- 128×128 resolution simulates low-resource capture but removes high-frequency detail that full-resolution detectors rely on.
+- DIRE was evaluated zero-shot. Fine-tuning it on in-domain data would likely close part of the gap.
+- The unseen set covers two commercial generators. Results may differ for open-weight models such as FLUX or SDXL.
+- The ID documents are privacy-masked or synthetic, not real government IDs.
+
+## Recommendations for practitioners
+
+- Don't ship on AUROC. Measure TPR at your actual false-positive budget, on generators you didn't train on.
+- Prefer frequency-domain features over a pretrained reconstruction score when you can't fine-tune.
+- Treat the detector as one signal: add provenance (C2PA, SynthID watermarks), metadata checks, and human review for borderline scores.
+
+---
+
+## Citation
+
+```
+Jeevan Parajuli. "Security Under Diffusion: Evaluating Pretrained DIRE and
+Frequency-Based Deepfake Detectors for KYC and SOC Operations."
+University of Louisiana Monroe, 2026.
+https://github.com/jeevanparajuli856/Security-Under-Diffusion
+```
+
+**Contact:** Jeevan Parajuli · [LinkedIn](https://www.linkedin.com/in/jeevanparajuli856) · parajulij@warhawks.ulm.edu
